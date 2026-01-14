@@ -10,15 +10,15 @@ import streamlit as st
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
 
-# -----------------------------
-# Config (fixos)
-# -----------------------------
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
 COUNTER_FILE = "counter.json"
 
 DEFAULTS = {
     "processed_by": "Edgecore Labs Inc.",
-    "status": "Processing",
     "sender": "ENOR",
+    "status": "Processing",
     "prefix": "EDG-",
 }
 
@@ -36,11 +36,10 @@ REQUIRED_COLS = [
     "REMARKS/OBSERVATIONS",
 ]
 
-# -----------------------------
-# Helpers (corrigidos)
-# -----------------------------
-def safe_str(v) -> str:
-    """Converte valores para string, tratando NaN/None e evitando 'nan'."""
+# =========================================================
+# FUNÇÕES UTILITÁRIAS (ANTI-ERRO)
+# =========================================================
+def safe_str(v):
     if v is None:
         return ""
     try:
@@ -51,85 +50,74 @@ def safe_str(v) -> str:
     s = str(v).strip()
     return "" if s.lower() == "nan" else s
 
-def money_fmt(x) -> str:
-    """Formata valor monetário. Se vazio/NaN/inválido -> vazio."""
+
+def money_fmt(v):
     try:
-        if x is None or pd.isna(x):
+        if v is None or pd.isna(v):
             return ""
-        return f"{float(x):,.2f}"
+        return f"{float(v):,.2f}"
     except Exception:
         return ""
 
-def clean_account_text(s: str) -> str:
-    """Remove prefixos tipo 'acc:', 'acct:', 'account:' etc."""
-    s = safe_str(s)
-    s = re.sub(r"^(acc|acct|account)\s*[:\-]?\s*", "", s, flags=re.IGNORECASE)
-    return s.strip()
 
-def pick_account(iban, acct) -> str:
-    """Prefere IBAN se existir; senão Account. Limpa prefixos."""
-    v = safe_str(iban) if safe_str(iban) else safe_str(acct)
-    return clean_account_text(v)
+def clean_account(v):
+    s = safe_str(v)
+    return re.sub(r"^(acc|acct|account)\s*[:\-]?\s*", "", s, flags=re.IGNORECASE).strip()
+
+
+def pick_account(iban, account):
+    return clean_account(iban) if safe_str(iban) else clean_account(account)
+
+
+def append_country(address, country):
+    a = safe_str(address)
+    c = safe_str(country)
+    if not c:
+        return a
+    if c.lower() in a.lower():
+        return a
+    if not a:
+        return c
+    return f"{a}, {c}"
+
 
 def load_counter():
-    """SEQ contínuo (global) salvo em counter.json."""
     if not os.path.exists(COUNTER_FILE):
         return {"last_seq": 0}
     try:
         with open(COUNTER_FILE, "r") as f:
-            c = json.load(f)
-        if "last_seq" not in c:
-            c["last_seq"] = 0
-        return c
+            return json.load(f)
     except Exception:
         return {"last_seq": 0}
 
-def save_counter(c):
-    with open(COUNTER_FILE, "w") as f:
-        json.dump(c, f)
 
-def next_sequence(counter) -> int:
+def save_counter(counter):
+    with open(COUNTER_FILE, "w") as f:
+        json.dump(counter, f)
+
+
+def next_sequence(counter):
     counter["last_seq"] += 1
     return counter["last_seq"]
 
-def build_reference(prefix: str, currency: str, dt: datetime, seq: int) -> str:
-    # EDG-{CUR}{MMDDYY}{SEQ6}
-    cur = safe_str(currency).upper()
-    return f"{prefix}{cur}{dt.strftime('%m%d%y')}{seq:06d}"
 
-def append_country_once(address: str, country: str) -> str:
-    """
-    Evita duplicar país e evita quebra de linha (mais estável no PDF).
-    Se 'country' já estiver no address, não adiciona.
-    """
-    addr = safe_str(address).strip()
-    cty = safe_str(country).strip()
-    if not cty:
-        return addr
-    if cty.lower() in addr.lower():
-        return addr
-    if not addr:
-        return cty
-    return f"{addr}, {cty}"
+def build_reference(currency, date, seq):
+    return f"{DEFAULTS['prefix']}{currency}{date.strftime('%m%d%y')}{seq:06d}"
 
-def wrap_text(text: str, max_len: int = 85):
-    """Quebra texto em linhas por tamanho (simples e suficiente pro template)."""
+
+def wrap_text(text, limit=90):
     t = safe_str(text)
-    if not t:
-        return []
-    return [t[i:i + max_len] for i in range(0, len(t), max_len)]
+    return [t[i:i + limit] for i in range(0, len(t), limit)] if t else []
 
-def gen_pdf(data: dict) -> bytes:
-    """
-    Gera PDF em memória e devolve bytes.
-    - Não imprime linhas vazias (layout mais limpo)
-    - Não imprime 'nan'
-    """
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=LETTER)
+
+# =========================================================
+# PDF
+# =========================================================
+def generate_pdf(data):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=LETTER)
     _, h = LETTER
 
-    # Título
     c.setFont("Helvetica-Bold", 14)
     c.drawString(50, h - 60, "WIRE TRANSFER CONFIRMATION")
 
@@ -137,26 +125,128 @@ def gen_pdf(data: dict) -> bytes:
 
     def field(label, value):
         nonlocal y
-        # NÃO imprime linhas vazias -> evita PDF “morto”
         if not safe_str(value):
             return
-
         c.setFont("Helvetica-Bold", 10)
         c.drawString(50, y, label)
-
         c.setFont("Helvetica", 10)
-        lines = wrap_text(value, max_len=90)
-        if not lines:
-            return
-
+        lines = wrap_text(value)
         c.drawString(200, y, lines[0])
         y -= 16
-        for extra in lines[1:]:
-            c.drawString(200, y, extra)
+        for line in lines[1:]:
+            c.drawString(200, y, line)
             y -= 16
 
-    # Campos
-    field("Processed By:", data.get("processed_by"))
-    field("Date:", data.get("date_str"))
-    field("Status:", data.get("status"))
-    field("Reference Number:", data.get("reference_number"))_
+    field("Processed By:", data["processed_by"])
+    field("Date:", data["date"])
+    field("Status:", data["status"])
+    field("Reference Number:", data["reference"])
+    field("Sender:", data["sender"])
+    field("Currency:", data["currency"])
+    field("Amount:", data["amount"])
+    field("Beneficiary Name:", data["beneficiary_name"])
+    field("Beneficiary Address:", data["beneficiary_address"])
+    field("Beneficiary Account No.:", data["beneficiary_account"])
+    field("Beneficiary Bank:", data["bank_name"])
+    field("Bank Address:", data["bank_address"])
+    field("SWIFT Code:", data["swift"])
+    field("Intermediary Bank:", "-")
+    field("Intermediary Bank SWIFT:", "-")
+    field("Purpose of Payment:", data["purpose"])
+    field("Additional Remarks:", data["remarks"])
+
+    y -= 10
+    c.setFont("Helvetica", 9)
+    c.drawString(
+        50,
+        y,
+        "This document confirms the wire transfer has been placed in pursuant to our standard terms and conditions."
+    )
+    y -= 14
+    c.drawString(50, y, f"Generated on {data['generated_on']}")
+
+    c.showPage()
+    c.save()
+
+    buffer.seek(0)
+    return buffer.read()
+
+# =========================================================
+# STREAMLIT UI
+# =========================================================
+st.set_page_config(page_title="Pre-Receipt Generator", layout="centered")
+st.title("Pre-Receipt Generator (Excel → PDF)")
+
+uploaded = st.file_uploader("Upload Excel file", type=["xlsx"])
+
+if uploaded:
+    df = pd.read_excel(uploaded)
+
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        st.error(f"Missing columns: {missing}")
+        st.stop()
+
+    counter = load_counter()
+    now = datetime.now()
+
+    zip_buffer = io.BytesIO()
+    generated = 0
+    skipped = 0
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for _, row in df.iterrows():
+            currency = safe_str(row.get("Currency")).upper()
+            amount = money_fmt(row.get("Amount"))
+
+            if not currency or not amount:
+                skipped += 1
+                continue
+
+            seq = next_sequence(counter)
+            ref = build_reference(currency, now, seq)
+
+            data = {
+                "processed_by": DEFAULTS["processed_by"],
+                "sender": DEFAULTS["sender"],
+                "status": DEFAULTS["status"],
+                "date": now.strftime("%m/%d/%Y"),
+                "generated_on": now.strftime("%m/%d/%Y at %H:%M:%S"),
+                "reference": ref,
+                "currency": currency,
+                "amount": amount,
+                "beneficiary_name": safe_str(row.get("Beneficiary Name")),
+                "beneficiary_address": append_country(
+                    row.get("Beneficiary Address"),
+                    row.get("Beneficiary Country")
+                ),
+                "beneficiary_account": pick_account(
+                    row.get("IBAN"),
+                    row.get("Account")
+                ),
+                "bank_name": safe_str(row.get("Bank Name")),
+                "bank_address": append_country(
+                    row.get("Bank Address"),
+                    row.get("Bank Country")
+                ),
+                "swift": safe_str(row.get("SWIFT Code")),
+                "purpose": safe_str(row.get("Purpose")),
+                "remarks": safe_str(row.get("REMARKS/OBSERVATIONS")),
+            }
+
+            pdf = generate_pdf(data)
+            zipf.writestr(f"{ref}.pdf", pdf)
+            generated += 1
+
+    save_counter(counter)
+
+    zip_buffer.seek(0)
+
+    st.success(f"PDFs generated: {generated} | Skipped lines: {skipped}")
+
+    st.download_button(
+        "Download ZIP",
+        zip_buffer,
+        file_name=f"pre_receipts_{now.strftime('%Y%m%d_%H%M%S')}.zip",
+        mime="application/zip"
+    )
