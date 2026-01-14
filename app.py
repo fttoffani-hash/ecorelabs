@@ -2,6 +2,7 @@ import io
 import os
 import json
 import zipfile
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -10,7 +11,7 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
 
 # -----------------------------
-# Config
+# Config (fixos)
 # -----------------------------
 COUNTER_FILE = "counter.json"
 
@@ -36,27 +37,44 @@ REQUIRED_COLS = [
 ]
 
 # -----------------------------
-# Helpers
+# Helpers (corrigidos)
 # -----------------------------
 def safe_str(v) -> str:
-    return "" if pd.isna(v) else str(v)
+    """Converte valores para string, tratando NaN/None e evitando 'nan'."""
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    s = str(v).strip()
+    return "" if s.lower() == "nan" else s
 
 def money_fmt(x) -> str:
+    """Formata valor monetário. Se vazio/NaN/inválido -> vazio."""
     try:
+        if x is None or pd.isna(x):
+            return ""
         return f"{float(x):,.2f}"
     except Exception:
-        return safe_str(x)
+        return ""
+
+def clean_account_text(s: str) -> str:
+    """Remove prefixos tipo 'acc:', 'acct:', 'account:' etc."""
+    s = safe_str(s)
+    s = re.sub(r"^(acc|acct|account)\s*[:\-]?\s*", "", s, flags=re.IGNORECASE)
+    return s.strip()
 
 def pick_account(iban, acct) -> str:
-    iban = safe_str(iban).strip()
-    acct = safe_str(acct).strip()
-    return iban if iban else acct
+    """Prefere IBAN se existir; senão Account. Limpa prefixos."""
+    v = safe_str(iban) if safe_str(iban) else safe_str(acct)
+    return clean_account_text(v)
 
 def load_counter():
-    # no Streamlit Cloud, esse arquivo fica no mesmo diretório do app
+    """SEQ contínuo (global) salvo em counter.json."""
     if not os.path.exists(COUNTER_FILE):
         return {"last_seq": 0}
-
     try:
         with open(COUNTER_FILE, "r") as f:
             c = json.load(f)
@@ -76,15 +94,40 @@ def next_sequence(counter) -> int:
 
 def build_reference(prefix: str, currency: str, dt: datetime, seq: int) -> str:
     # EDG-{CUR}{MMDDYY}{SEQ6}
-    return f"{prefix}{currency}{dt.strftime('%m%d%y')}{seq:06d}"
+    cur = safe_str(currency).upper()
+    return f"{prefix}{cur}{dt.strftime('%m%d%y')}{seq:06d}"
+
+def append_country_once(address: str, country: str) -> str:
+    """
+    Evita duplicar país e evita quebra de linha (mais estável no PDF).
+    Se 'country' já estiver no address, não adiciona.
+    """
+    addr = safe_str(address).strip()
+    cty = safe_str(country).strip()
+    if not cty:
+        return addr
+    if cty.lower() in addr.lower():
+        return addr
+    if not addr:
+        return cty
+    return f"{addr}, {cty}"
+
+def wrap_text(text: str, max_len: int = 85):
+    """Quebra texto em linhas por tamanho (simples e suficiente pro template)."""
+    t = safe_str(text)
+    if not t:
+        return []
+    return [t[i:i + max_len] for i in range(0, len(t), max_len)]
 
 def gen_pdf(data: dict) -> bytes:
     """
     Gera PDF em memória e devolve bytes.
+    - Não imprime linhas vazias (layout mais limpo)
+    - Não imprime 'nan'
     """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=LETTER)
-    w, h = LETTER
+    _, h = LETTER
 
     # Título
     c.setFont("Helvetica-Bold", 14)
@@ -94,15 +137,17 @@ def gen_pdf(data: dict) -> bytes:
 
     def field(label, value):
         nonlocal y
+        # NÃO imprime linhas vazias -> evita PDF “morto”
+        if not safe_str(value):
+            return
+
         c.setFont("Helvetica-Bold", 10)
         c.drawString(50, y, label)
+
         c.setFont("Helvetica", 10)
-
-        txt = str(value) if value is not None else ""
-
-        # quebra simples para caber
-        max_len = 85
-        lines = [txt[i:i + max_len] for i in range(0, len(txt), max_len)] or [""]
+        lines = wrap_text(value, max_len=90)
+        if not lines:
+            return
 
         c.drawString(200, y, lines[0])
         y -= 16
@@ -111,117 +156,7 @@ def gen_pdf(data: dict) -> bytes:
             y -= 16
 
     # Campos
-    field("Processed By:", data["processed_by"])
-    field("Date:", data["date_str"])
-    field("Status:", data["status"])
-    field("Reference Number:", data["reference_number"])
-    field("Sender:", data["sender"])
-    field("Currency:", data["currency"])
-    field("Amount:", data["amount_str"])
-    field("Beneficiary Name:", data["beneficiary_name"])
-    field("Beneficiary Address:", data["beneficiary_address"])
-    field("Beneficiary Account No.:", data["beneficiary_account_no"])
-    field("Beneficiary Bank:", data["beneficiary_bank"])
-    field("Bank Address:", data["bank_address"])
-    field("SWIFT Code:", data["swift"])
-    field("Intermediary Bank:", "-")
-    field("Intermediary Bank SWIFT:", "-")
-    field("Purpose of Payment:", data["purpose"])
-    field("Details:", "")
-    field("Additional Remarks:", data.get("remarks", ""))
-
-    # Rodapé
-    y -= 10
-    c.setFont("Helvetica", 9)
-    c.drawString(
-        50, y,
-        "This document confirms the wire transfer has been placed in pursuant to our standard terms and conditions."
-    )
-    y -= 14
-    c.drawString(50, y, f"Generated on {data['generated_on']}")
-
-    c.showPage()
-    c.save()
-
-    buf.seek(0)
-    return buf.read()
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Pré-recibos via Excel", layout="centered")
-st.title("Gerador de Pré-Recibos (Excel → PDFs)")
-st.write(
-    f"**Processed By:** {DEFAULTS['processed_by']}  |  "
-    f"**Sender:** {DEFAULTS['sender']}  |  "
-    f"**Status:** {DEFAULTS['status']}  |  "
-    f"**SEQ:** contínuo (6 dígitos)"
-)
-
-uploaded = st.file_uploader("Envie o Excel (template do cliente)", type=["xlsx"])
-
-if uploaded:
-    df = pd.read_excel(uploaded)
-
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        st.error(f"Faltando colunas no Excel: {missing}")
-        st.stop()
-
-    if df.empty:
-        st.warning("A planilha veio sem linhas.")
-        st.stop()
-
-    counter = load_counter()
-    dt = datetime.now()
-
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for _, r in df.iterrows():
-            seq = next_sequence(counter)
-            currency = safe_str(r["Currency"]).strip()
-            ref = build_reference(DEFAULTS["prefix"], currency, dt, seq)
-
-            beneficiary_address = safe_str(r["Beneficiary Address"]).strip()
-            beneficiary_country = safe_str(r.get("Beneficiary Country", "")).strip()
-            if beneficiary_country:
-                beneficiary_address = f"{beneficiary_address}\n{beneficiary_country}"
-
-            bank_address = safe_str(r["Bank Address"]).strip()
-            bank_country = safe_str(r.get("Bank Country", "")).strip()
-            if bank_country:
-                bank_address = f"{bank_address}\n{bank_country}"
-
-            data = {
-                "processed_by": DEFAULTS["processed_by"],
-                "sender": DEFAULTS["sender"],
-                "status": DEFAULTS["status"],
-                "date_str": dt.strftime("%m/%d/%Y"),
-                "generated_on": dt.strftime("%m/%d/%Y at %H:%M:%S"),
-                "reference_number": ref,
-                "currency": currency,
-                "amount_str": money_fmt(r["Amount"]),
-                "beneficiary_name": safe_str(r["Beneficiary Name"]).strip(),
-                "beneficiary_address": beneficiary_address,
-                "beneficiary_account_no": pick_account(r.get("IBAN"), r.get("Account")),
-                "beneficiary_bank": safe_str(r["Bank Name"]).strip(),
-                "bank_address": bank_address,
-                "swift": safe_str(r["SWIFT Code"]).strip(),
-                "purpose": safe_str(r["Purpose"]).strip(),
-                "remarks": safe_str(r.get("REMARKS/OBSERVATIONS", "")).strip(),
-            }
-
-            pdf_bytes = gen_pdf(data)
-            zf.writestr(f"{ref}.pdf", pdf_bytes)
-
-    save_counter(counter)
-
-    zip_buf.seek(0)
-    st.success(f"Pronto! Gereis {len(df)} PDFs (1 por linha).")
-
-    st.download_button(
-        "Baixar ZIP com os PDFs",
-        data=zip_buf.getvalue(),
-        file_name=f"pre-receipts_{dt.strftime('%Y%m%d_%H%M%S')}.zip",
-        mime="application/zip",
-    )
+    field("Processed By:", data.get("processed_by"))
+    field("Date:", data.get("date_str"))
+    field("Status:", data.get("status"))
+    field("Reference Number:", data.get("reference_number"))_
