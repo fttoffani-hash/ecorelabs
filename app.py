@@ -3,6 +3,7 @@ import os
 import json
 import zipfile
 import re
+import unicodedata
 from datetime import datetime
 
 import pandas as pd
@@ -11,7 +12,7 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
 
 # =========================================================
-# CONFIGURAÇÃO
+# CONFIG
 # =========================================================
 COUNTER_FILE = "counter.json"
 
@@ -37,41 +38,69 @@ REQUIRED_COLS = [
 ]
 
 # =========================================================
-# FUNÇÕES UTILITÁRIAS (ANTI-ERRO)
+# TEXT SANITIZATION (remove black boxes)
 # =========================================================
-def safe_str(v):
-    if v is None:
-        return ""
+def safe_isna(v) -> bool:
     try:
-        if pd.isna(v):
-            return ""
+        return pd.isna(v)
     except Exception:
-        pass
-    s = str(v).strip()
-    return "" if s.lower() == "nan" else s
+        return False
 
+def sanitize_text(v) -> str:
+    """
+    Remove caracteres invisíveis/controle e garante texto renderizável no ReportLab.
+    - Normaliza Unicode (NFKC)
+    - Remove categorias C* (control/format/surrogate/private use)
+    - Converte para latin-1 com substituição (evita quadradinhos)
+    """
+    if v is None or safe_isna(v):
+        return ""
 
-def money_fmt(v):
+    s = str(v)
+
+    # normaliza unicode (ex: espaços “esquisitos”)
+    s = unicodedata.normalize("NFKC", s)
+
+    # remove chars de controle/format etc.
+    cleaned = []
+    for ch in s:
+        cat = unicodedata.category(ch)
+        if cat.startswith("C"):  # Cc, Cf, Cs, Co, Cn
+            continue
+        cleaned.append(ch)
+    s = "".join(cleaned)
+
+    # troca NBSP por espaço normal e colapsa espaços
+    s = s.replace("\u00A0", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+
+    # garante compatibilidade com fonte padrão do PDF (latin-1)
+    s = s.encode("latin-1", errors="replace").decode("latin-1")
+
+    # remove "nan"
+    return "" if s.strip().lower() == "nan" else s.strip()
+
+def money_fmt(v) -> str:
     try:
-        if v is None or pd.isna(v):
+        if v is None or safe_isna(v):
             return ""
         return f"{float(v):,.2f}"
     except Exception:
         return ""
 
+def clean_account(v: str) -> str:
+    s = sanitize_text(v)
+    # Só remove prefixos do tipo "acc:" / "acct:" / "account:" (com : ou -)
+    # NÃO remove "ACCOUNT NO."
+    s = re.sub(r"^(acc|acct|account)\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
+    return s.strip()
 
-def clean_account(v):
-    s = safe_str(v)
-    return re.sub(r"^(acc|acct|account)\s*[:\-]?\s*", "", s, flags=re.IGNORECASE).strip()
+def pick_account(iban, account) -> str:
+    return clean_account(iban) if sanitize_text(iban) else clean_account(account)
 
-
-def pick_account(iban, account):
-    return clean_account(iban) if safe_str(iban) else clean_account(account)
-
-
-def append_country(address, country):
-    a = safe_str(address)
-    c = safe_str(country)
+def append_country(address, country) -> str:
+    a = sanitize_text(address)
+    c = sanitize_text(country)
     if not c:
         return a
     if c.lower() in a.lower():
@@ -80,35 +109,60 @@ def append_country(address, country):
         return c
     return f"{a}, {c}"
 
+def normalize_swift(v) -> str:
+    s = sanitize_text(v).upper()
+    # mantém somente letras/números (SWIFT válido é alfanumérico)
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s
 
+# =========================================================
+# COUNTER (SEQ contínuo)
+# =========================================================
 def load_counter():
     if not os.path.exists(COUNTER_FILE):
         return {"last_seq": 0}
     try:
         with open(COUNTER_FILE, "r") as f:
-            return json.load(f)
+            c = json.load(f)
+        if "last_seq" not in c:
+            c["last_seq"] = 0
+        return c
     except Exception:
         return {"last_seq": 0}
-
 
 def save_counter(counter):
     with open(COUNTER_FILE, "w") as f:
         json.dump(counter, f)
 
-
 def next_sequence(counter):
     counter["last_seq"] += 1
     return counter["last_seq"]
 
-
 def build_reference(currency, date, seq):
-    return f"{DEFAULTS['prefix']}{currency}{date.strftime('%m%d%y')}{seq:06d}"
+    cur = sanitize_text(currency).upper()
+    return f"{DEFAULTS['prefix']}{cur}{date.strftime('%m%d%y')}{seq:06d}"
 
-
-def wrap_text(text, limit=90):
-    t = safe_str(text)
-    return [t[i:i + limit] for i in range(0, len(t), limit)] if t else []
-
+# =========================================================
+# WRAP (word wrap)
+# =========================================================
+def wrap_words(text: str, max_chars: int = 90):
+    t = sanitize_text(text)
+    if not t:
+        return []
+    words = t.split(" ")
+    lines = []
+    cur = ""
+    for w in words:
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= max_chars:
+            cur = f"{cur} {w}"
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
 
 # =========================================================
 # PDF
@@ -125,12 +179,15 @@ def generate_pdf(data):
 
     def field(label, value):
         nonlocal y
-        if not safe_str(value):
+        value = sanitize_text(value)
+        if not value:
             return
+
         c.setFont("Helvetica-Bold", 10)
         c.drawString(50, y, label)
+
         c.setFont("Helvetica", 10)
-        lines = wrap_text(value)
+        lines = wrap_words(value, max_chars=92)
         c.drawString(200, y, lines[0])
         y -= 16
         for line in lines[1:]:
@@ -163,7 +220,7 @@ def generate_pdf(data):
         "This document confirms the wire transfer has been placed in pursuant to our standard terms and conditions."
     )
     y -= 14
-    c.drawString(50, y, f"Generated on {data['generated_on']}")
+    c.drawString(50, y, f"Generated on {sanitize_text(data['generated_on'])}")
 
     c.showPage()
     c.save()
@@ -196,9 +253,10 @@ if uploaded:
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
         for _, row in df.iterrows():
-            currency = safe_str(row.get("Currency")).upper()
+            currency = sanitize_text(row.get("Currency")).upper()
             amount = money_fmt(row.get("Amount"))
 
+            # evita PDFs ruins
             if not currency or not amount:
                 skipped += 1
                 continue
@@ -215,7 +273,7 @@ if uploaded:
                 "reference": ref,
                 "currency": currency,
                 "amount": amount,
-                "beneficiary_name": safe_str(row.get("Beneficiary Name")),
+                "beneficiary_name": sanitize_text(row.get("Beneficiary Name")),
                 "beneficiary_address": append_country(
                     row.get("Beneficiary Address"),
                     row.get("Beneficiary Country")
@@ -224,14 +282,14 @@ if uploaded:
                     row.get("IBAN"),
                     row.get("Account")
                 ),
-                "bank_name": safe_str(row.get("Bank Name")),
+                "bank_name": sanitize_text(row.get("Bank Name")),
                 "bank_address": append_country(
                     row.get("Bank Address"),
                     row.get("Bank Country")
                 ),
-                "swift": safe_str(row.get("SWIFT Code")),
-                "purpose": safe_str(row.get("Purpose")),
-                "remarks": safe_str(row.get("REMARKS/OBSERVATIONS")),
+                "swift": normalize_swift(row.get("SWIFT Code")),
+                "purpose": sanitize_text(row.get("Purpose")),
+                "remarks": sanitize_text(row.get("REMARKS/OBSERVATIONS")),
             }
 
             pdf = generate_pdf(data)
@@ -248,5 +306,5 @@ if uploaded:
         "Download ZIP",
         zip_buffer,
         file_name=f"pre_receipts_{now.strftime('%Y%m%d_%H%M%S')}.zip",
-        mime="application/zip"
+        mime="application/zip",
     )
