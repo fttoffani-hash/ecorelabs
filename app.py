@@ -39,7 +39,7 @@ REQUIRED_COLS = [
 ]
 
 # =========================================================
-# TEXT SANITIZATION (remove black boxes)
+# HELPERS
 # =========================================================
 def safe_isna(v) -> bool:
     try:
@@ -47,28 +47,51 @@ def safe_isna(v) -> bool:
     except Exception:
         return False
 
+# Mantém pontuação comum (inclui parênteses). Remove invisíveis/controle.
+_ALLOWED_PUNCT = set("()[]{}.,;:/\\-+&@#%$!?\"'*=<>_")
 def sanitize_text(v) -> str:
     if v is None or safe_isna(v):
         return ""
 
     s = str(v)
+
+    # Normaliza (mantém parênteses normais)
     s = unicodedata.normalize("NFKC", s)
 
-    cleaned = []
+    out = []
     for ch in s:
         cat = unicodedata.category(ch)
-        if cat.startswith("C"):  # remove controles/invisíveis
+
+        # remove controles/invisíveis
+        if cat.startswith("C"):
             continue
-        cleaned.append(ch)
-    s = "".join(cleaned)
 
-    s = s.replace("\u00A0", " ").strip()
-    s = re.sub(r"\s+", " ", s)
+        # normaliza NBSP para espaço
+        if ch == "\u00A0":
+            out.append(" ")
+            continue
 
-    # garante compatibilidade com Helvetica
-    s = s.encode("latin-1", errors="replace").decode("latin-1")
+        o = ord(ch)
 
-    s = s.strip()
+        # ASCII imprimível
+        if 32 <= o <= 126:
+            out.append(ch)
+            continue
+
+        # Para qualquer coisa fora do ASCII:
+        # - se for letra/número unicode, troca por espaço (evita caixa preta)
+        # - se for pontuação unicode “estranha”, tenta mapear para equivalente ASCII via NFKC (já feito),
+        #   então se ainda sobrou, vira espaço.
+        if ch.isalnum():
+            out.append(" ")
+        else:
+            out.append(" ")
+
+    s = "".join(out)
+
+    # colapsa espaços sem “juntar” palavras
+    s = re.sub(r"[ \t]+", " ", s).strip()
+
     return "" if s.lower() == "nan" else s
 
 def money_fmt(v) -> str:
@@ -81,7 +104,6 @@ def money_fmt(v) -> str:
 
 def clean_account(v: str) -> str:
     s = sanitize_text(v)
-    # remove somente prefixos com ":" ou "-"
     s = re.sub(r"^(acc|acct|account)\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
     return s.strip()
 
@@ -105,8 +127,6 @@ def normalize_swift(v) -> str:
 
 # =========================================================
 # COUNTER (RESET DIÁRIO)
-# counter.json exemplo:
-# {"last_date": "011426", "last_seq": 8}
 # =========================================================
 def load_counter():
     if not os.path.exists(COUNTER_FILE):
@@ -163,7 +183,7 @@ def wrap_to_width(text: str, font_name: str, font_size: int, max_width: float):
                 lines.append(cur)
                 cur = w
 
-        # quebra "palavra" gigante sem espaços
+        # quebra palavra gigante (sem espaços)
         while cur and width(cur) > max_width:
             cut = len(cur)
             while cut > 1 and width(cur[:cut]) > max_width:
@@ -271,7 +291,7 @@ if uploaded:
     counter = load_counter()
     now = datetime.now()
 
-    mmddyy = now.strftime("%m%d%y")   # MMDDYY do dia
+    mmddyy = now.strftime("%m%d%y")
     date_str = now.strftime("%m/%d/%Y")
 
     zip_buffer = io.BytesIO()
@@ -287,7 +307,7 @@ if uploaded:
                 skipped += 1
                 continue
 
-            seq = next_sequence_for_today(counter, mmddyy)  # reset diário
+            seq = next_sequence_for_today(counter, mmddyy)
             ref = build_reference(currency, mmddyy, seq)
 
             data = {
@@ -300,39 +320,28 @@ if uploaded:
                 "currency": currency,
                 "amount": amount,
                 "beneficiary_name": sanitize_text(row.get("Beneficiary Name")),
-                "beneficiary_address": append_country(
-                    row.get("Beneficiary Address"),
-                    row.get("Beneficiary Country")
-                ),
-                "beneficiary_account": pick_account(
-                    row.get("IBAN"),
-                    row.get("Account")
-                ),
+                "beneficiary_address": append_country(row.get("Beneficiary Address"), row.get("Beneficiary Country")),
+                "beneficiary_account": pick_account(row.get("IBAN"), row.get("Account")),
                 "bank_name": sanitize_text(row.get("Bank Name")),
-                "bank_address": append_country(
-                    row.get("Bank Address"),
-                    row.get("Bank Country")
-                ),
+                "bank_address": append_country(row.get("Bank Address"), row.get("Bank Country")),
                 "swift": normalize_swift(row.get("SWIFT Code")),
                 "purpose": sanitize_text(row.get("Purpose")),
                 "remarks": sanitize_text(row.get("REMARKS/OBSERVATIONS")),
             }
 
             pdf_bytes = generate_pdf(data)
-
-            # Nome do arquivo dentro do ZIP: MMDDYY_001_USD.pdf (reset diário)
             filename = f"{mmddyy}_{seq:03d}_{currency}.pdf"
             zipf.writestr(filename, pdf_bytes)
             generated += 1
 
     save_counter(counter)
 
-    zip_buffer.seek(0)
+    zip_bytes = zip_buffer.getvalue()
     st.success(f"PDFs generated: {generated} | Skipped lines: {skipped}")
 
     st.download_button(
         label="Download ZIP",
-        data=zip_buffer,  # <- passa o BytesIO direto (estável)
+        data=zip_bytes,
         file_name=f"pre_receipts_{mmddyy}.zip",
         mime="application/zip",
     )
