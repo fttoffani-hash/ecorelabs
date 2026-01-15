@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
 
 # =========================================================
 # CONFIG
@@ -47,38 +48,27 @@ def safe_isna(v) -> bool:
         return False
 
 def sanitize_text(v) -> str:
-    """
-    Remove caracteres invisíveis/controle e garante texto renderizável no ReportLab.
-    - Normaliza Unicode (NFKC)
-    - Remove categorias C* (control/format/surrogate/private use)
-    - Converte para latin-1 com substituição (evita quadradinhos)
-    """
     if v is None or safe_isna(v):
         return ""
 
     s = str(v)
-
-    # normaliza unicode (ex: espaços “esquisitos”)
     s = unicodedata.normalize("NFKC", s)
 
-    # remove chars de controle/format etc.
     cleaned = []
     for ch in s:
         cat = unicodedata.category(ch)
-        if cat.startswith("C"):  # Cc, Cf, Cs, Co, Cn
+        if cat.startswith("C"):
             continue
         cleaned.append(ch)
     s = "".join(cleaned)
 
-    # troca NBSP por espaço normal e colapsa espaços
     s = s.replace("\u00A0", " ").strip()
     s = re.sub(r"\s+", " ", s)
 
-    # garante compatibilidade com fonte padrão do PDF (latin-1)
+    # Helvetica safe
     s = s.encode("latin-1", errors="replace").decode("latin-1")
-
-    # remove "nan"
-    return "" if s.strip().lower() == "nan" else s.strip()
+    s = s.strip()
+    return "" if s.lower() == "nan" else s
 
 def money_fmt(v) -> str:
     try:
@@ -90,8 +80,6 @@ def money_fmt(v) -> str:
 
 def clean_account(v: str) -> str:
     s = sanitize_text(v)
-    # Só remove prefixos do tipo "acc:" / "acct:" / "account:" (com : ou -)
-    # NÃO remove "ACCOUNT NO."
     s = re.sub(r"^(acc|acct|account)\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
     return s.strip()
 
@@ -111,57 +99,81 @@ def append_country(address, country) -> str:
 
 def normalize_swift(v) -> str:
     s = sanitize_text(v).upper()
-    # mantém somente letras/números (SWIFT válido é alfanumérico)
-    s = re.sub(r"[^A-Z0-9]", "", s)
-    return s
+    return re.sub(r"[^A-Z0-9]", "", s)
 
 # =========================================================
-# COUNTER (SEQ contínuo)
+# COUNTER (RESET DIÁRIO)
+# counter.json vai ficar assim, por exemplo:
+# {"last_date": "011426", "last_seq": 8}
 # =========================================================
 def load_counter():
     if not os.path.exists(COUNTER_FILE):
-        return {"last_seq": 0}
+        return {"last_date": "", "last_seq": 0}
     try:
         with open(COUNTER_FILE, "r") as f:
             c = json.load(f)
+        if "last_date" not in c:
+            c["last_date"] = ""
         if "last_seq" not in c:
             c["last_seq"] = 0
         return c
     except Exception:
-        return {"last_seq": 0}
+        return {"last_date": "", "last_seq": 0}
 
 def save_counter(counter):
     with open(COUNTER_FILE, "w") as f:
         json.dump(counter, f)
 
-def next_sequence(counter):
+def next_sequence_for_today(counter, today_mmddyy: str) -> int:
+    """
+    Se mudou o dia (MMDDYY), reseta para 1.
+    """
+    if counter.get("last_date") != today_mmddyy:
+        counter["last_date"] = today_mmddyy
+        counter["last_seq"] = 0
     counter["last_seq"] += 1
     return counter["last_seq"]
 
-def build_reference(currency, date, seq):
+def build_reference(currency, mmddyy, seq):
     cur = sanitize_text(currency).upper()
-    return f"{DEFAULTS['prefix']}{cur}{date.strftime('%m%d%y')}{seq:06d}"
+    return f"{DEFAULTS['prefix']}{cur}{mmddyy}{seq:03d}"
 
 # =========================================================
-# WRAP (word wrap)
+# WRAP POR LARGURA (EVITA CORTE)
 # =========================================================
-def wrap_words(text: str, max_chars: int = 90):
+def wrap_to_width(text: str, font_name: str, font_size: int, max_width: float):
     t = sanitize_text(text)
     if not t:
         return []
+
+    def width(s):
+        return pdfmetrics.stringWidth(s, font_name, font_size)
+
     words = t.split(" ")
     lines = []
     cur = ""
+
     for w in words:
         if not cur:
             cur = w
-        elif len(cur) + 1 + len(w) <= max_chars:
-            cur = f"{cur} {w}"
         else:
-            lines.append(cur)
-            cur = w
+            test = f"{cur} {w}"
+            if width(test) <= max_width:
+                cur = test
+            else:
+                lines.append(cur)
+                cur = w
+
+        while cur and width(cur) > max_width:
+            cut = len(cur)
+            while cut > 1 and width(cur[:cut]) > max_width:
+                cut -= 1
+            lines.append(cur[:cut])
+            cur = cur[cut:]
+
     if cur:
         lines.append(cur)
+
     return lines
 
 # =========================================================
@@ -170,12 +182,24 @@ def wrap_words(text: str, max_chars: int = 90):
 def generate_pdf(data):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=LETTER)
-    _, h = LETTER
+    page_w, page_h = LETTER
 
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(50, h - 60, "WIRE TRANSFER CONFIRMATION")
+    left_margin = 50
+    right_margin = 50
+    label_x = left_margin
+    value_x = 220
+    max_value_width = page_w - right_margin - value_x
 
-    y = h - 95
+    title_font = ("Helvetica-Bold", 14)
+    label_font = ("Helvetica-Bold", 10)
+    value_font = ("Helvetica", 10)
+    footer_font = ("Helvetica", 9)
+
+    c.setFont(*title_font)
+    c.drawString(left_margin, page_h - 60, "WIRE TRANSFER CONFIRMATION")
+
+    y = page_h - 95
+    line_gap = 16
 
     def field(label, value):
         nonlocal y
@@ -183,16 +207,16 @@ def generate_pdf(data):
         if not value:
             return
 
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(50, y, label)
+        c.setFont(*label_font)
+        c.drawString(label_x, y, label)
 
-        c.setFont("Helvetica", 10)
-        lines = wrap_words(value, max_chars=92)
-        c.drawString(200, y, lines[0])
-        y -= 16
-        for line in lines[1:]:
-            c.drawString(200, y, line)
-            y -= 16
+        c.setFont(*value_font)
+        lines = wrap_to_width(value, value_font[0], value_font[1], max_value_width)
+        c.drawString(value_x, y, lines[0])
+        y -= line_gap
+        for ln in lines[1:]:
+            c.drawString(value_x, y, ln)
+            y -= line_gap
 
     field("Processed By:", data["processed_by"])
     field("Date:", data["date"])
@@ -213,14 +237,14 @@ def generate_pdf(data):
     field("Additional Remarks:", data["remarks"])
 
     y -= 10
-    c.setFont("Helvetica", 9)
+    c.setFont(*footer_font)
     c.drawString(
-        50,
+        left_margin,
         y,
         "This document confirms the wire transfer has been placed in pursuant to our standard terms and conditions."
     )
     y -= 14
-    c.drawString(50, y, f"Generated on {sanitize_text(data['generated_on'])}")
+    c.drawString(left_margin, y, f"Generated on {sanitize_text(data['generated_on'])}")
 
     c.showPage()
     c.save()
@@ -247,6 +271,9 @@ if uploaded:
     counter = load_counter()
     now = datetime.now()
 
+    mmddyy = now.strftime("%m%d%y")  # MMDDYY do dia
+    date_str = now.strftime("%m/%d/%Y")
+
     zip_buffer = io.BytesIO()
     generated = 0
     skipped = 0
@@ -256,19 +283,18 @@ if uploaded:
             currency = sanitize_text(row.get("Currency")).upper()
             amount = money_fmt(row.get("Amount"))
 
-            # evita PDFs ruins
             if not currency or not amount:
                 skipped += 1
                 continue
 
-            seq = next_sequence(counter)
-            ref = build_reference(currency, now, seq)
+            seq = next_sequence_for_today(counter, mmddyy)  # RESSETA DIÁRIO
+            ref = build_reference(currency, mmddyy, seq)
 
             data = {
                 "processed_by": DEFAULTS["processed_by"],
                 "sender": DEFAULTS["sender"],
                 "status": DEFAULTS["status"],
-                "date": now.strftime("%m/%d/%Y"),
+                "date": date_str,
                 "generated_on": now.strftime("%m/%d/%Y at %H:%M:%S"),
                 "reference": ref,
                 "currency": currency,
@@ -293,18 +319,21 @@ if uploaded:
             }
 
             pdf = generate_pdf(data)
-            zipf.writestr(f"{ref}.pdf", pdf)
+
+            # Nome do arquivo: MMDDYY + seq 001 (e inclui currency pra evitar colisão)
+            filename = f"{mmddyy}_{seq:03d}_{currency}.pdf"
+            zipf.writestr(filename, pdf)
             generated += 1
 
     save_counter(counter)
 
     zip_buffer.seek(0)
-
     st.success(f"PDFs generated: {generated} | Skipped lines: {skipped}")
 
     st.download_button(
         "Download ZIP",
         zip_buffer,
-        file_name=f"pre_receipts_{now.strftime('%Y%m%d_%H%M%S')}.zip",
+        file_name=f"pre_receipts_{mmddyy}.zip",
         mime="application/zip",
+        data=zip_buffer.getvalue(),
     )
