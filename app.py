@@ -57,7 +57,7 @@ def sanitize_text(v) -> str:
     cleaned = []
     for ch in s:
         cat = unicodedata.category(ch)
-        if cat.startswith("C"):
+        if cat.startswith("C"):  # remove controles/invisíveis
             continue
         cleaned.append(ch)
     s = "".join(cleaned)
@@ -65,8 +65,9 @@ def sanitize_text(v) -> str:
     s = s.replace("\u00A0", " ").strip()
     s = re.sub(r"\s+", " ", s)
 
-    # Helvetica safe
+    # garante compatibilidade com Helvetica
     s = s.encode("latin-1", errors="replace").decode("latin-1")
+
     s = s.strip()
     return "" if s.lower() == "nan" else s
 
@@ -80,6 +81,7 @@ def money_fmt(v) -> str:
 
 def clean_account(v: str) -> str:
     s = sanitize_text(v)
+    # remove somente prefixos com ":" ou "-"
     s = re.sub(r"^(acc|acct|account)\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
     return s.strip()
 
@@ -103,7 +105,7 @@ def normalize_swift(v) -> str:
 
 # =========================================================
 # COUNTER (RESET DIÁRIO)
-# counter.json vai ficar assim, por exemplo:
+# counter.json exemplo:
 # {"last_date": "011426", "last_seq": 8}
 # =========================================================
 def load_counter():
@@ -125,9 +127,6 @@ def save_counter(counter):
         json.dump(counter, f)
 
 def next_sequence_for_today(counter, today_mmddyy: str) -> int:
-    """
-    Se mudou o dia (MMDDYY), reseta para 1.
-    """
     if counter.get("last_date") != today_mmddyy:
         counter["last_date"] = today_mmddyy
         counter["last_seq"] = 0
@@ -164,6 +163,7 @@ def wrap_to_width(text: str, font_name: str, font_size: int, max_width: float):
                 lines.append(cur)
                 cur = w
 
+        # quebra "palavra" gigante sem espaços
         while cur and width(cur) > max_width:
             cut = len(cur)
             while cut > 1 and width(cur[:cut]) > max_width:
@@ -271,7 +271,7 @@ if uploaded:
     counter = load_counter()
     now = datetime.now()
 
-    mmddyy = now.strftime("%m%d%y")  # MMDDYY do dia
+    mmddyy = now.strftime("%m%d%y")   # MMDDYY do dia
     date_str = now.strftime("%m/%d/%Y")
 
     zip_buffer = io.BytesIO()
@@ -287,7 +287,7 @@ if uploaded:
                 skipped += 1
                 continue
 
-            seq = next_sequence_for_today(counter, mmddyy)  # RESSETA DIÁRIO
+            seq = next_sequence_for_today(counter, mmddyy)  # reset diário
             ref = build_reference(currency, mmddyy, seq)
 
             data = {
@@ -318,11 +318,11 @@ if uploaded:
                 "remarks": sanitize_text(row.get("REMARKS/OBSERVATIONS")),
             }
 
-            pdf = generate_pdf(data)
+            pdf_bytes = generate_pdf(data)
 
-            # Nome do arquivo: MMDDYY + seq 001 (e inclui currency pra evitar colisão)
+            # Nome do arquivo dentro do ZIP: MMDDYY_001_USD.pdf (reset diário)
             filename = f"{mmddyy}_{seq:03d}_{currency}.pdf"
-            zipf.writestr(filename, pdf)
+            zipf.writestr(filename, pdf_bytes)
             generated += 1
 
     save_counter(counter)
@@ -331,9 +331,8 @@ if uploaded:
     st.success(f"PDFs generated: {generated} | Skipped lines: {skipped}")
 
     st.download_button(
-        "Download ZIP",
-        zip_buffer,
+        label="Download ZIP",
+        data=zip_buffer,  # <- passa o BytesIO direto (estável)
         file_name=f"pre_receipts_{mmddyy}.zip",
         mime="application/zip",
-        data=zip_buffer.getvalue(),
     )
