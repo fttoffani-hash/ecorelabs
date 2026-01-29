@@ -19,7 +19,7 @@ COUNTER_FILE = "counter.json"
 
 DEFAULTS = {
     "processed_by": "Edgecore Labs Inc.",
-    "sender": "ENOR",
+    "sender": "ENOR",  # fallback
     "status": "Processing",
     "prefix": "EDG-",
 }
@@ -47,51 +47,38 @@ def safe_isna(v) -> bool:
     except Exception:
         return False
 
-# Mantém pontuação comum (inclui parênteses). Remove invisíveis/controle.
 _ALLOWED_PUNCT = set("()[]{}.,;:/\\-+&@#%$!?\"'*=<>_")
 def sanitize_text(v) -> str:
     if v is None or safe_isna(v):
         return ""
 
     s = str(v)
-
-    # Normaliza (mantém parênteses normais)
     s = unicodedata.normalize("NFKC", s)
 
     out = []
     for ch in s:
         cat = unicodedata.category(ch)
 
-        # remove controles/invisíveis
         if cat.startswith("C"):
             continue
 
-        # normaliza NBSP para espaço
         if ch == "\u00A0":
             out.append(" ")
             continue
 
         o = ord(ch)
 
-        # ASCII imprimível
         if 32 <= o <= 126:
             out.append(ch)
             continue
 
-        # Para qualquer coisa fora do ASCII:
-        # - se for letra/número unicode, troca por espaço (evita caixa preta)
-        # - se for pontuação unicode “estranha”, tenta mapear para equivalente ASCII via NFKC (já feito),
-        #   então se ainda sobrou, vira espaço.
         if ch.isalnum():
             out.append(" ")
         else:
             out.append(" ")
 
     s = "".join(out)
-
-    # colapsa espaços sem “juntar” palavras
     s = re.sub(r"[ \t]+", " ", s).strip()
-
     return "" if s.lower() == "nan" else s
 
 def money_fmt(v) -> str:
@@ -183,7 +170,6 @@ def wrap_to_width(text: str, font_name: str, font_size: int, max_width: float):
                 lines.append(cur)
                 cur = w
 
-        # quebra palavra gigante (sem espaços)
         while cur and width(cur) > max_width:
             cut = len(cur)
             while cut > 1 and width(cur[:cut]) > max_width:
@@ -242,7 +228,7 @@ def generate_pdf(data):
     field("Date:", data["date"])
     field("Status:", data["status"])
     field("Reference Number:", data["reference"])
-    field("Sender:", data["sender"])
+    field("Sender:", data["sender"])  # <- aqui entra o nome digitado
     field("Currency:", data["currency"])
     field("Amount:", data["amount"])
     field("Beneficiary Name:", data["beneficiary_name"])
@@ -273,75 +259,116 @@ def generate_pdf(data):
     return buffer.read()
 
 # =========================================================
-# STREAMLIT UI
+# STREAMLIT UI (2 telas)
 # =========================================================
 st.set_page_config(page_title="Pre-Receipt Generator", layout="centered")
-st.title("Pre-Receipt Generator (Excel → PDF)")
 
-uploaded = st.file_uploader("Upload Excel file", type=["xlsx"])
+# estado inicial
+if "step" not in st.session_state:
+    st.session_state.step = 1
+if "client_name" not in st.session_state:
+    st.session_state.client_name = ""
 
-if uploaded:
-    df = pd.read_excel(uploaded)
+def go_to_step(n: int):
+    st.session_state.step = n
 
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        st.error(f"Missing columns: {missing}")
-        st.stop()
+# ---------- TELA 1: Nome do cliente ----------
+if st.session_state.step == 1:
+    st.title("Pre-Receipt Generator")
+    st.subheader("Step 1 — Client")
 
-    counter = load_counter()
-    now = datetime.now()
+    client = st.text_input("Client name (this will appear as Sender):", value=st.session_state.client_name)
 
-    mmddyy = now.strftime("%m%d%y")
-    date_str = now.strftime("%m/%d/%Y")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("Continue →", type="primary"):
+            name = sanitize_text(client)
+            if not name:
+                st.error("Please enter a client name to continue.")
+            else:
+                st.session_state.client_name = name
+                go_to_step(2)
+                st.rerun()
 
-    zip_buffer = io.BytesIO()
-    generated = 0
-    skipped = 0
+    with col2:
+        if st.button("Reset"):
+            st.session_state.client_name = ""
+            st.session_state.step = 1
+            st.rerun()
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for _, row in df.iterrows():
-            currency = sanitize_text(row.get("Currency")).upper()
-            amount = money_fmt(row.get("Amount"))
+# ---------- TELA 2: Upload + geração ----------
+elif st.session_state.step == 2:
+    st.title("Pre-Receipt Generator (Excel → PDF)")
+    st.caption(f"Client (Sender): **{st.session_state.client_name}**")
 
-            if not currency or not amount:
-                skipped += 1
-                continue
+    if st.button("← Back"):
+        go_to_step(1)
+        st.rerun()
 
-            seq = next_sequence_for_today(counter, mmddyy)
-            ref = build_reference(currency, mmddyy, seq)
+    uploaded = st.file_uploader("Upload Excel file", type=["xlsx"])
 
-            data = {
-                "processed_by": DEFAULTS["processed_by"],
-                "sender": DEFAULTS["sender"],
-                "status": DEFAULTS["status"],
-                "date": date_str,
-                "generated_on": now.strftime("%m/%d/%Y at %H:%M:%S"),
-                "reference": ref,
-                "currency": currency,
-                "amount": amount,
-                "beneficiary_name": sanitize_text(row.get("Beneficiary Name")),
-                "beneficiary_address": append_country(row.get("Beneficiary Address"), row.get("Beneficiary Country")),
-                "beneficiary_account": pick_account(row.get("IBAN"), row.get("Account")),
-                "bank_name": sanitize_text(row.get("Bank Name")),
-                "bank_address": append_country(row.get("Bank Address"), row.get("Bank Country")),
-                "swift": normalize_swift(row.get("SWIFT Code")),
-                "purpose": sanitize_text(row.get("Purpose")),
-                "remarks": sanitize_text(row.get("REMARKS/OBSERVATIONS")),
-            }
+    if uploaded:
+        df = pd.read_excel(uploaded)
 
-            pdf_bytes = generate_pdf(data)
-            filename = f"{mmddyy}_{seq:03d}_{currency}.pdf"
-            zipf.writestr(filename, pdf_bytes)
-            generated += 1
+        missing = [c for c in REQUIRED_COLS if c not in df.columns]
+        if missing:
+            st.error(f"Missing columns: {missing}")
+            st.stop()
 
-    save_counter(counter)
+        counter = load_counter()
+        now = datetime.now()
 
-    zip_bytes = zip_buffer.getvalue()
-    st.success(f"PDFs generated: {generated} | Skipped lines: {skipped}")
+        mmddyy = now.strftime("%m%d%y")
+        date_str = now.strftime("%m/%d/%Y")
 
-    st.download_button(
-        label="Download ZIP",
-        data=zip_bytes,
-        file_name=f"pre_receipts_{mmddyy}.zip",
-        mime="application/zip",
-    )
+        zip_buffer = io.BytesIO()
+        generated = 0
+        skipped = 0
+
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for _, row in df.iterrows():
+                currency = sanitize_text(row.get("Currency")).upper()
+                amount = money_fmt(row.get("Amount"))
+
+                if not currency or not amount:
+                    skipped += 1
+                    continue
+
+                seq = next_sequence_for_today(counter, mmddyy)
+                ref = build_reference(currency, mmddyy, seq)
+
+                data = {
+                    "processed_by": DEFAULTS["processed_by"],
+                    "sender": st.session_state.client_name,  # <- NOME DIGITADO
+                    "status": DEFAULTS["status"],
+                    "date": date_str,
+                    "generated_on": now.strftime("%m/%d/%Y at %H:%M:%S"),
+                    "reference": ref,
+                    "currency": currency,
+                    "amount": amount,
+                    "beneficiary_name": sanitize_text(row.get("Beneficiary Name")),
+                    "beneficiary_address": append_country(row.get("Beneficiary Address"), row.get("Beneficiary Country")),
+                    "beneficiary_account": pick_account(row.get("IBAN"), row.get("Account")),
+                    "bank_name": sanitize_text(row.get("Bank Name")),
+                    "bank_address": append_country(row.get("Bank Address"), row.get("Bank Country")),
+                    "swift": normalize_swift(row.get("SWIFT Code")),
+                    "purpose": sanitize_text(row.get("Purpose")),
+                    "remarks": sanitize_text(row.get("REMARKS/OBSERVATIONS")),
+                }
+
+                pdf_bytes = generate_pdf(data)
+                filename = f"{mmddyy}_{seq:03d}_{currency}.pdf"
+                zipf.writestr(filename, pdf_bytes)
+                generated += 1
+
+        save_counter(counter)
+
+        zip_bytes = zip_buffer.getvalue()
+        st.success(f"PDFs generated: {generated} | Skipped lines: {skipped}")
+
+        st.download_button(
+            label="Download ZIP",
+            data=zip_bytes,
+            file_name=f"pre_receipts_{mmddyy}.zip",
+            mime="application/zip",
+        )
