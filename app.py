@@ -2,7 +2,6 @@ import io
 import os
 import json
 import zipfile
-import re
 import unicodedata
 from datetime import datetime
 
@@ -10,7 +9,6 @@ import pandas as pd
 import streamlit as st
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
 
 # =========================================================
 # CONFIG
@@ -19,11 +17,12 @@ COUNTER_FILE = "counter.json"
 
 DEFAULTS = {
     "processed_by": "Edgecore Labs Inc.",
-    "sender": "ENOR",  # fallback
+    "sender": "ENOR",
     "status": "Processing",
     "prefix": "EDG-",
 }
 
+# ✅ OPTION A: IBAN REMOVED (Account is the only column)
 REQUIRED_COLS = [
     "Amount",
     "Currency",
@@ -34,341 +33,244 @@ REQUIRED_COLS = [
     "Bank Address",
     "SWIFT Code",
     "Account",
-    "IBAN",
-    "REMARKS/OBSERVATIONS",
+    "REMARKS",
 ]
 
 # =========================================================
 # HELPERS
 # =========================================================
-def safe_isna(v) -> bool:
-    try:
-        return pd.isna(v)
-    except Exception:
-        return False
-
-_ALLOWED_PUNCT = set("()[]{}.,;:/\\-+&@#%$!?\"'*=<>_")
-def sanitize_text(v) -> str:
-    if v is None or safe_isna(v):
+def normalize_text(value) -> str:
+    """Safe text for PDF (avoid encoding/control chars)."""
+    if value is None:
         return ""
+    s = str(value).strip()
 
-    s = str(v)
-    s = unicodedata.normalize("NFKC", s)
+    # Replace weird line breaks/tabs
+    s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
 
-    out = []
-    for ch in s:
-        cat = unicodedata.category(ch)
+    # Remove control chars (except \n)
+    s = "".join(ch for ch in s if ch == "\n" or ord(ch) >= 32)
 
-        if cat.startswith("C"):
-            continue
+    # Normalize unicode (avoid PDF rendering issues)
+    s = unicodedata.normalize("NFKD", s)
+    return s
 
-        if ch == "\u00A0":
-            out.append(" ")
-            continue
 
-        o = ord(ch)
-
-        if 32 <= o <= 126:
-            out.append(ch)
-            continue
-
-        if ch.isalnum():
-            out.append(" ")
-        else:
-            out.append(" ")
-
-    s = "".join(out)
-    s = re.sub(r"[ \t]+", " ", s).strip()
-    return "" if s.lower() == "nan" else s
-
-def money_fmt(v) -> str:
-    try:
-        if v is None or safe_isna(v):
-            return ""
-        return f"{float(v):,.2f}"
-    except Exception:
-        return ""
-
-def clean_account(v: str) -> str:
-    s = sanitize_text(v)
-    s = re.sub(r"^(acc|acct|account)\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
-    return s.strip()
-
-def pick_account(iban, account) -> str:
-    return clean_account(iban) if sanitize_text(iban) else clean_account(account)
-
-def append_country(address, country) -> str:
-    a = sanitize_text(address)
-    c = sanitize_text(country)
-    if not c:
-        return a
-    if c.lower() in a.lower():
-        return a
-    if not a:
-        return c
-    return f"{a}, {c}"
-
-def normalize_swift(v) -> str:
-    s = sanitize_text(v).upper()
-    return re.sub(r"[^A-Z0-9]", "", s)
-
-# =========================================================
-# COUNTER (RESET DIÁRIO)
-# =========================================================
-def load_counter():
+def load_counter() -> int:
     if not os.path.exists(COUNTER_FILE):
-        return {"last_date": "", "last_seq": 0}
+        return 0
     try:
-        with open(COUNTER_FILE, "r") as f:
-            c = json.load(f)
-        if "last_date" not in c:
-            c["last_date"] = ""
-        if "last_seq" not in c:
-            c["last_seq"] = 0
-        return c
+        with open(COUNTER_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return int(data.get("counter", 0))
     except Exception:
-        return {"last_date": "", "last_seq": 0}
+        return 0
 
-def save_counter(counter):
-    with open(COUNTER_FILE, "w") as f:
-        json.dump(counter, f)
 
-def next_sequence_for_today(counter, today_mmddyy: str) -> int:
-    if counter.get("last_date") != today_mmddyy:
-        counter["last_date"] = today_mmddyy
-        counter["last_seq"] = 0
-    counter["last_seq"] += 1
-    return counter["last_seq"]
+def save_counter(counter: int) -> None:
+    with open(COUNTER_FILE, "w", encoding="utf-8") as f:
+        json.dump({"counter": counter}, f)
 
-def build_reference(currency, mmddyy, seq):
-    cur = sanitize_text(currency).upper()
-    return f"{DEFAULTS['prefix']}{cur}{mmddyy}{seq:03d}"
+
+def next_reference_number(prefix: str) -> str:
+    c = load_counter() + 1
+    save_counter(c)
+    return f"{prefix}{c:06d}"
+
+
+def validate_columns(df: pd.DataFrame) -> list[str]:
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    return missing
+
+
+def safe_filename(name: str) -> str:
+    name = normalize_text(name)
+    name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+    return name.strip("_") or "document"
+
 
 # =========================================================
-# WRAP POR LARGURA (EVITA CORTE)
+# PDF GENERATION
 # =========================================================
-def wrap_to_width(text: str, font_name: str, font_size: int, max_width: float):
-    t = sanitize_text(text)
-    if not t:
-        return []
+def draw_label_value(c, x, y, label, value, max_width=520):
+    """Draw label and value; wraps value."""
+    label = normalize_text(label)
+    value = normalize_text(value)
 
-    def width(s):
-        return pdfmetrics.stringWidth(s, font_name, font_size)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(x, y, label)
 
-    words = t.split(" ")
-    lines = []
-    cur = ""
+    c.setFont("Helvetica", 10)
+    text_obj = c.beginText(x + 140, y)
+    text_obj.setLeading(12)
 
+    # basic wrap
+    words = value.replace("\n", " \n ").split(" ")
+    line = ""
     for w in words:
-        if not cur:
-            cur = w
+        if w == "\n":
+            text_obj.textLine(line.rstrip())
+            line = ""
+            continue
+
+        candidate = (line + " " + w).strip()
+        if c.stringWidth(candidate, "Helvetica", 10) <= (max_width - (x + 140)):
+            line = candidate
         else:
-            test = f"{cur} {w}"
-            if width(test) <= max_width:
-                cur = test
-            else:
-                lines.append(cur)
-                cur = w
+            if line:
+                text_obj.textLine(line)
+            line = w
 
-        while cur and width(cur) > max_width:
-            cut = len(cur)
-            while cut > 1 and width(cur[:cut]) > max_width:
-                cut -= 1
-            lines.append(cur[:cut])
-            cur = cur[cut:]
+    if line:
+        text_obj.textLine(line)
 
-    if cur:
-        lines.append(cur)
+    c.drawText(text_obj)
 
-    return lines
 
-# =========================================================
-# PDF
-# =========================================================
-def generate_pdf(data):
+def generate_pdf_bytes(row: dict, defaults: dict) -> bytes:
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=LETTER)
-    page_w, page_h = LETTER
+    width, height = LETTER
 
-    left_margin = 50
-    right_margin = 50
-    label_x = left_margin
-    value_x = 220
-    max_value_width = page_w - right_margin - value_x
+    # Header
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, height - 50, "Payment Instruction")
 
-    title_font = ("Helvetica-Bold", 14)
-    label_font = ("Helvetica-Bold", 10)
-    value_font = ("Helvetica", 10)
-    footer_font = ("Helvetica", 9)
+    c.setFont("Helvetica", 10)
+    c.drawString(40, height - 70, f"Processed by: {normalize_text(defaults['processed_by'])}")
+    c.drawString(40, height - 85, f"Sender: {normalize_text(defaults['sender'])}")
+    c.drawString(40, height - 100, f"Status: {normalize_text(defaults['status'])}")
 
-    c.setFont(*title_font)
-    c.drawString(left_margin, page_h - 60, "WIRE TRANSFER CONFIRMATION")
+    # Reference & date
+    ref = next_reference_number(defaults["prefix"])
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    y = page_h - 95
-    line_gap = 16
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(40, height - 125, "Reference Number:")
+    c.setFont("Helvetica", 10)
+    c.drawString(180, height - 125, ref)
 
-    def field(label, value):
-        nonlocal y
-        value = sanitize_text(value)
-        if not value:
-            return
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(40, height - 140, "Generated:")
+    c.setFont("Helvetica", 10)
+    c.drawString(180, height - 140, now)
 
-        c.setFont(*label_font)
-        c.drawString(label_x, y, label)
+    # Body
+    y = height - 175
+    gap = 18
 
-        c.setFont(*value_font)
-        lines = wrap_to_width(value, value_font[0], value_font[1], max_value_width)
-        c.drawString(value_x, y, lines[0])
-        y -= line_gap
-        for ln in lines[1:]:
-            c.drawString(value_x, y, ln)
-            y -= line_gap
+    # Pull fields (Account is the only one)
+    data = {
+        "Amount": row.get("Amount", ""),
+        "Currency": row.get("Currency", ""),
+        "Purpose": row.get("Purpose", ""),
+        "Beneficiary Name": row.get("Beneficiary Name", ""),
+        "Beneficiary Address": row.get("Beneficiary Address", ""),
+        "Bank Name": row.get("Bank Name", ""),
+        "Bank Address": row.get("Bank Address", ""),
+        "SWIFT Code": row.get("SWIFT Code", ""),
+        "Account": row.get("Account", ""),
+        "REMARKS": row.get("REMARKS", ""),
+    }
 
-    field("Processed By:", data["processed_by"])
-    field("Date:", data["date"])
-    field("Status:", data["status"])
-    field("Reference Number:", data["reference"])
-    field("Sender:", data["sender"])  # <- aqui entra o nome digitado
-    field("Currency:", data["currency"])
-    field("Amount:", data["amount"])
-    field("Beneficiary Name:", data["beneficiary_name"])
-    field("Beneficiary Address:", data["beneficiary_address"])
-    field("Beneficiary Account No.:", data["beneficiary_account"])
-    field("Beneficiary Bank:", data["bank_name"])
-    field("Bank Address:", data["bank_address"])
-    field("SWIFT Code:", data["swift"])
-    field("Intermediary Bank:", "-")
-    field("Intermediary Bank SWIFT:", "-")
-    field("Purpose of Payment:", data["purpose"])
-    field("Additional Remarks:", data["remarks"])
+    draw_label_value(c, 40, y, "Amount:", f"{data['Amount']} {data['Currency']}")
+    y -= gap * 2
 
-    y -= 10
-    c.setFont(*footer_font)
-    c.drawString(
-        left_margin,
-        y,
-        "This document confirms the wire transfer has been placed in pursuant to our standard terms and conditions."
-    )
-    y -= 14
-    c.drawString(left_margin, y, f"Generated on {sanitize_text(data['generated_on'])}")
+    draw_label_value(c, 40, y, "Purpose:", data["Purpose"])
+    y -= gap * 2
+
+    draw_label_value(c, 40, y, "Beneficiary Name:", data["Beneficiary Name"])
+    y -= gap * 2
+
+    draw_label_value(c, 40, y, "Beneficiary Address:", data["Beneficiary Address"])
+    y -= gap * 3
+
+    draw_label_value(c, 40, y, "Bank Name:", data["Bank Name"])
+    y -= gap * 2
+
+    draw_label_value(c, 40, y, "Bank Address:", data["Bank Address"])
+    y -= gap * 3
+
+    draw_label_value(c, 40, y, "SWIFT Code:", data["SWIFT Code"])
+    y -= gap * 2
+
+    # ✅ Account (replaces IBAN)
+    draw_label_value(c, 40, y, "Account:", data["Account"])
+    y -= gap * 2
+
+    draw_label_value(c, 40, y, "Remarks:", data["REMARKS"])
+    y -= gap * 2
+
+    # Footer
+    c.setFont("Helvetica-Oblique", 8)
+    c.drawString(40, 30, "Generated by internal tool. Please verify bank details before execution.")
 
     c.showPage()
     c.save()
-
     buffer.seek(0)
     return buffer.read()
 
+
 # =========================================================
-# STREAMLIT UI (2 telas)
+# STREAMLIT APP
 # =========================================================
-st.set_page_config(page_title="Pre-Receipt Generator", layout="centered")
+st.set_page_config(page_title="PDF Generator", layout="centered")
+st.title("PDF Generator (Batch)")
 
-# estado inicial
-if "step" not in st.session_state:
-    st.session_state.step = 1
-if "client_name" not in st.session_state:
-    st.session_state.client_name = ""
+st.caption("Upload an Excel/CSV file. One PDF will be generated per row and downloaded as a ZIP.")
 
-def go_to_step(n: int):
-    st.session_state.step = n
+with st.expander("Defaults", expanded=True):
+    processed_by = st.text_input("Processed by", value=DEFAULTS["processed_by"])
+    sender = st.text_input("Sender", value=DEFAULTS["sender"])
+    status = st.text_input("Status", value=DEFAULTS["status"])
+    prefix = st.text_input("Reference Prefix", value=DEFAULTS["prefix"])
 
-# ---------- TELA 1: Nome do cliente ----------
-if st.session_state.step == 1:
-    st.title("Pre-Receipt Generator")
-    st.subheader("Step 1 — Client")
+defaults = {
+    "processed_by": processed_by,
+    "sender": sender,
+    "status": status,
+    "prefix": prefix,
+}
 
-    client = st.text_input("Client name (this will appear as Sender):", value=st.session_state.client_name)
+uploaded = st.file_uploader("Upload file", type=["xlsx", "xls", "csv"])
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("Continue →", type="primary"):
-            name = sanitize_text(client)
-            if not name:
-                st.error("Please enter a client name to continue.")
-            else:
-                st.session_state.client_name = name
-                go_to_step(2)
-                st.rerun()
+if uploaded:
+    try:
+        if uploaded.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded)
+        else:
+            df = pd.read_excel(uploaded)
 
-    with col2:
-        if st.button("Reset"):
-            st.session_state.client_name = ""
-            st.session_state.step = 1
-            st.rerun()
+        # Normalize column names exactly (trim spaces)
+        df.columns = [str(c).strip() for c in df.columns]
 
-# ---------- TELA 2: Upload + geração ----------
-elif st.session_state.step == 2:
-    st.title("Pre-Receipt Generator (Excel → PDF)")
-    st.caption(f"Client (Sender): **{st.session_state.client_name}**")
-
-    if st.button("← Back"):
-        go_to_step(1)
-        st.rerun()
-
-    uploaded = st.file_uploader("Upload Excel file", type=["xlsx"])
-
-    if uploaded:
-        df = pd.read_excel(uploaded)
-
-        missing = [c for c in REQUIRED_COLS if c not in df.columns]
+        missing = validate_columns(df)
         if missing:
             st.error(f"Missing columns: {missing}")
+            st.info(f"Required columns are: {REQUIRED_COLS}")
             st.stop()
 
-        counter = load_counter()
-        now = datetime.now()
+        st.success(f"File loaded. Rows: {len(df)}")
+        st.dataframe(df.head(20), use_container_width=True)
 
-        mmddyy = now.strftime("%m%d%y")
-        date_str = now.strftime("%m/%d/%Y")
+        if st.button("Generate ZIP of PDFs"):
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i, row in df.iterrows():
+                    row_dict = {k: row.get(k, "") for k in df.columns}
+                    pdf_bytes = generate_pdf_bytes(row_dict, defaults)
 
-        zip_buffer = io.BytesIO()
-        generated = 0
-        skipped = 0
+                    ben = safe_filename(row_dict.get("Beneficiary Name", f"row_{i+1}"))
+                    filename = f"{i+1:03d}_{ben}.pdf"
+                    zf.writestr(filename, pdf_bytes)
 
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for _, row in df.iterrows():
-                currency = sanitize_text(row.get("Currency")).upper()
-                amount = money_fmt(row.get("Amount"))
+            zip_buffer.seek(0)
+            st.download_button(
+                label="Download ZIP",
+                data=zip_buffer.getvalue(),
+                file_name="pdfs.zip",
+                mime="application/zip",
+            )
 
-                if not currency or not amount:
-                    skipped += 1
-                    continue
-
-                seq = next_sequence_for_today(counter, mmddyy)
-                ref = build_reference(currency, mmddyy, seq)
-
-                data = {
-                    "processed_by": DEFAULTS["processed_by"],
-                    "sender": st.session_state.client_name,  # <- NOME DIGITADO
-                    "status": DEFAULTS["status"],
-                    "date": date_str,
-                    "generated_on": now.strftime("%m/%d/%Y at %H:%M:%S"),
-                    "reference": ref,
-                    "currency": currency,
-                    "amount": amount,
-                    "beneficiary_name": sanitize_text(row.get("Beneficiary Name")),
-                    "beneficiary_address": append_country(row.get("Beneficiary Address"), row.get("Beneficiary Country")),
-                    "beneficiary_account": pick_account(row.get("IBAN"), row.get("Account")),
-                    "bank_name": sanitize_text(row.get("Bank Name")),
-                    "bank_address": append_country(row.get("Bank Address"), row.get("Bank Country")),
-                    "swift": normalize_swift(row.get("SWIFT Code")),
-                    "purpose": sanitize_text(row.get("Purpose")),
-                    "remarks": sanitize_text(row.get("REMARKS/OBSERVATIONS")),
-                }
-
-                pdf_bytes = generate_pdf(data)
-                filename = f"{mmddyy}_{seq:03d}_{currency}.pdf"
-                zipf.writestr(filename, pdf_bytes)
-                generated += 1
-
-        save_counter(counter)
-
-        zip_bytes = zip_buffer.getvalue()
-        st.success(f"PDFs generated: {generated} | Skipped lines: {skipped}")
-
-        st.download_button(
-            label="Download ZIP",
-            data=zip_bytes,
-            file_name=f"pre_receipts_{mmddyy}.zip",
-            mime="application/zip",
-        )
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
