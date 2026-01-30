@@ -2,13 +2,20 @@ import io
 import os
 import json
 import zipfile
+import re
 import unicodedata
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.colors import black, white
+
 
 # =========================================================
 # CONFIG
@@ -22,7 +29,7 @@ DEFAULTS = {
     "prefix": "EDG-",
 }
 
-# ✅ OPTION A: IBAN REMOVED (Account is the only column)
+# Colunas mínimas (IBAN é opcional; Account existe como coluna)
 REQUIRED_COLS = [
     "Amount",
     "Currency",
@@ -36,35 +43,36 @@ REQUIRED_COLS = [
     "REMARKS",
 ]
 
+# Variações comuns para "Reference" (vamos tentar achar em qualquer uma)
+REFERENCE_KEYS = [
+    "Reference",
+    "Reference Number",
+    "Payment Reference",
+    "Payment reference",
+    "Customer Reference",
+    "Client Reference",
+    "Ref",
+    "REF",
+]
+
+# Fonte opcional pra evitar “quadradinhos” (tofu) em nomes/endereços com acento
+# Se você colocar o arquivo DejaVuSans.ttf na mesma pasta do app.py, ele usa.
+TTF_FONT_PATH = "DejaVuSans.ttf"
+TTF_FONT_NAME = "DejaVuSans"
+
+
 # =========================================================
 # HELPERS
 # =========================================================
-def normalize_text(value) -> str:
-    """Safe text for PDF (avoid encoding/control chars)."""
-    if value is None:
-        return ""
-    s = str(value).strip()
-
-    # Replace weird line breaks/tabs
-    s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
-
-    # Remove control chars (except \n)
-    s = "".join(ch for ch in s if ch == "\n" or ord(ch) >= 32)
-
-    # Normalize unicode (avoid PDF rendering issues)
-    s = unicodedata.normalize("NFKD", s)
-    return s
-
-
 def load_counter() -> int:
     if not os.path.exists(COUNTER_FILE):
-        return 0
+        return 1
     try:
         with open(COUNTER_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return int(data.get("counter", 0))
+        return int(data.get("counter", 1))
     except Exception:
-        return 0
+        return 1
 
 
 def save_counter(counter: int) -> None:
@@ -72,158 +80,250 @@ def save_counter(counter: int) -> None:
         json.dump({"counter": counter}, f)
 
 
-def next_reference_number(prefix: str) -> str:
-    c = load_counter() + 1
-    save_counter(c)
-    return f"{prefix}{c:06d}"
+def next_reference(prefix: str) -> str:
+    c = load_counter()
+    ref = f"{prefix}{c:06d}"
+    save_counter(c + 1)
+    return ref
 
 
-def validate_columns(df: pd.DataFrame) -> list[str]:
+def normalize_text(value) -> str:
+    """
+    - Converte para string
+    - Remove caracteres de controle/invisíveis que podem causar artefatos
+    - Normaliza unicode
+    - Remove quebras exageradas
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = str(value)
+
+    # Normaliza unicode (ex: acentos)
+    s = unicodedata.normalize("NFKC", s)
+
+    # Remove caracteres de controle (exceto \n e \t se você quiser; aqui removo todos)
+    s = "".join(ch for ch in s if ch.isprintable())
+
+    # Remove alguns chars comuns invisíveis
+    s = s.replace("\u200b", "").replace("\ufeff", "")
+
+    # Colapsa espaços
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s
+
+
+def pick_reference_from_row(row: dict) -> str:
+    # Procura em chaves candidatas
+    for k in REFERENCE_KEYS:
+        if k in row:
+            v = normalize_text(row.get(k))
+            if v:
+                return v
+
+    # fallback: tenta achar qualquer coluna que contenha "reference"
+    for k in row.keys():
+        if isinstance(k, str) and "reference" in k.lower():
+            v = normalize_text(row.get(k))
+            if v:
+                return v
+
+    return ""
+
+
+def register_font_if_available() -> str:
+    """
+    Retorna o nome da fonte a ser usada.
+    Se existir DejaVuSans.ttf na pasta, registra e usa.
+    Caso contrário, usa Helvetica.
+    """
+    try:
+        if os.path.exists(TTF_FONT_PATH):
+            pdfmetrics.registerFont(TTFont(TTF_FONT_NAME, TTF_FONT_PATH))
+            return TTF_FONT_NAME
+    except Exception:
+        pass
+    return "Helvetica"
+
+
+def validate_columns(df: pd.DataFrame) -> list:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     return missing
 
 
-def safe_filename(name: str) -> str:
-    name = normalize_text(name)
-    name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
-    return name.strip("_") or "document"
+def ensure_account_or_iban(row: dict) -> bool:
+    """
+    Garante que exista Account ou IBAN preenchido (IBAN pode existir ou não como coluna).
+    """
+    account = normalize_text(row.get("Account"))
+    iban = normalize_text(row.get("IBAN")) if "IBAN" in row else ""
+    return bool(account or iban)
+
+
+def format_amount(value) -> str:
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return ""
+        # Se vier como string, tenta limpar
+        s = str(value).replace(",", "")
+        x = float(s)
+        return f"{x:,.2f}"
+    except Exception:
+        return normalize_text(value)
+
+
+def safe_draw_label_value(c: canvas.Canvas, x_label, x_value, y, label, value, font_name, font_size=10):
+    """
+    Desenha label e value sem desenhar retângulos preenchidos (evita black boxes).
+    """
+    c.setFillColor(black)
+    c.setFont(font_name, font_size)
+    c.drawString(x_label, y, label)
+
+    c.setFont(font_name, font_size)
+    c.drawString(x_value, y, value)
+
+
+def wrap_text(c: canvas.Canvas, text: str, max_width: float, font_name: str, font_size: int) -> list:
+    """
+    Quebra texto em linhas para caber em max_width.
+    """
+    c.setFont(font_name, font_size)
+    words = text.split(" ")
+    lines = []
+    cur = ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        if c.stringWidth(test, font_name, font_size) <= max_width:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 # =========================================================
 # PDF GENERATION
 # =========================================================
-def draw_label_value(c, x, y, label, value, max_width=520):
-    """Draw label and value; wraps value."""
-    label = normalize_text(label)
-    value = normalize_text(value)
-
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(x, y, label)
-
-    c.setFont("Helvetica", 10)
-    text_obj = c.beginText(x + 140, y)
-    text_obj.setLeading(12)
-
-    # basic wrap
-    words = value.replace("\n", " \n ").split(" ")
-    line = ""
-    for w in words:
-        if w == "\n":
-            text_obj.textLine(line.rstrip())
-            line = ""
-            continue
-
-        candidate = (line + " " + w).strip()
-        if c.stringWidth(candidate, "Helvetica", 10) <= (max_width - (x + 140)):
-            line = candidate
-        else:
-            if line:
-                text_obj.textLine(line)
-            line = w
-
-    if line:
-        text_obj.textLine(line)
-
-    c.drawText(text_obj)
-
-
-def generate_pdf_bytes(row: dict, defaults: dict) -> bytes:
+def build_pdf_bytes(data: dict, defaults: dict) -> bytes:
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=LETTER)
     width, height = LETTER
 
+    font_name = register_font_if_available()
+
+    # Base layout
+    margin = 0.7 * inch
+    x_label = margin
+    x_value = margin + 2.2 * inch
+    y = height - margin
+
     # Header
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, height - 50, "Payment Instruction")
+    c.setFillColor(black)
+    c.setFont(font_name, 16)
+    c.drawString(margin, y, "Pre-Receipt")
+    y -= 0.35 * inch
 
-    c.setFont("Helvetica", 10)
-    c.drawString(40, height - 70, f"Processed by: {normalize_text(defaults['processed_by'])}")
-    c.drawString(40, height - 85, f"Sender: {normalize_text(defaults['sender'])}")
-    c.drawString(40, height - 100, f"Status: {normalize_text(defaults['status'])}")
+    c.setFont(font_name, 10)
+    c.drawString(margin, y, f"Processed by: {normalize_text(defaults.get('processed_by'))}")
+    y -= 0.2 * inch
+    c.drawString(margin, y, f"Sender: {normalize_text(defaults.get('sender'))}")
+    y -= 0.2 * inch
+    c.drawString(margin, y, f"Status: {normalize_text(defaults.get('status'))}")
+    y -= 0.2 * inch
+    c.drawString(margin, y, f"Generated at: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    y -= 0.35 * inch
 
-    # Reference & date
-    ref = next_reference_number(defaults["prefix"])
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    # Divider line (sem preenchimento, só linha)
+    c.setStrokeColor(black)
+    c.setLineWidth(1)
+    c.line(margin, y, width - margin, y)
+    y -= 0.35 * inch
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(40, height - 125, "Reference Number:")
-    c.setFont("Helvetica", 10)
-    c.drawString(180, height - 125, ref)
+    # Fields
+    # (Use normalize_text e sem retângulos preenchidos para evitar "black box")
+    fields = [
+        ("Reference ID:", normalize_text(data.get("_generated_reference_id", ""))),
+        ("Amount:", f"{format_amount(data.get('Amount'))} {normalize_text(data.get('Currency'))}".strip()),
+        ("Purpose:", normalize_text(data.get("Purpose"))),
+        ("Beneficiary Name:", normalize_text(data.get("Beneficiary Name"))),
+        ("Beneficiary Address:", normalize_text(data.get("Beneficiary Address"))),
+        ("Bank Name:", normalize_text(data.get("Bank Name"))),
+        ("Bank Address:", normalize_text(data.get("Bank Address"))),
+        ("SWIFT Code:", normalize_text(data.get("SWIFT Code"))),
+        ("Account:", normalize_text(data.get("Account"))),
+    ]
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(40, height - 140, "Generated:")
-    c.setFont("Helvetica", 10)
-    c.drawString(180, height - 140, now)
+    # IBAN opcional (se tiver)
+    if "IBAN" in data and normalize_text(data.get("IBAN")):
+        fields.append(("IBAN:", normalize_text(data.get("IBAN"))))
 
-    # Body
-    y = height - 175
-    gap = 18
+    # Remarks
+    fields.append(("REMARKS:", normalize_text(data.get("REMARKS"))))
 
-    # Pull fields (Account is the only one)
-    data = {
-        "Amount": row.get("Amount", ""),
-        "Currency": row.get("Currency", ""),
-        "Purpose": row.get("Purpose", ""),
-        "Beneficiary Name": row.get("Beneficiary Name", ""),
-        "Beneficiary Address": row.get("Beneficiary Address", ""),
-        "Bank Name": row.get("Bank Name", ""),
-        "Bank Address": row.get("Bank Address", ""),
-        "SWIFT Code": row.get("SWIFT Code", ""),
-        "Account": row.get("Account", ""),
-        "REMARKS": row.get("REMARKS", ""),
-    }
+    # ==========
+    # Reference (customer payment reference) DEVE SER O ÚLTIMO
+    # ==========
+    customer_ref = normalize_text(data.get("_customer_reference", ""))
+    if customer_ref:
+        fields.append(("Payment Reference:", customer_ref))
 
-    draw_label_value(c, 40, y, "Amount:", f"{data['Amount']} {data['Currency']}")
-    y -= gap * 2
+    # render fields with wrapping
+    max_width = (width - margin) - x_value
+    for label, value in fields:
+        if y < margin + 1.2 * inch:
+            c.showPage()
+            y = height - margin
+            c.setFont(font_name, 10)
 
-    draw_label_value(c, 40, y, "Purpose:", data["Purpose"])
-    y -= gap * 2
+        # label line
+        c.setFillColor(black)
+        c.setFont(font_name, 10)
+        c.drawString(x_label, y, label)
 
-    draw_label_value(c, 40, y, "Beneficiary Name:", data["Beneficiary Name"])
-    y -= gap * 2
+        # value (wrap)
+        value = value if value else "-"
+        lines = wrap_text(c, value, max_width, font_name, 10)
+        first = True
+        for line in lines:
+            if first:
+                c.drawString(x_value, y, line)
+                first = False
+            else:
+                y -= 0.18 * inch
+                c.drawString(x_value, y, line)
 
-    draw_label_value(c, 40, y, "Beneficiary Address:", data["Beneficiary Address"])
-    y -= gap * 3
-
-    draw_label_value(c, 40, y, "Bank Name:", data["Bank Name"])
-    y -= gap * 2
-
-    draw_label_value(c, 40, y, "Bank Address:", data["Bank Address"])
-    y -= gap * 3
-
-    draw_label_value(c, 40, y, "SWIFT Code:", data["SWIFT Code"])
-    y -= gap * 2
-
-    # ✅ Account (replaces IBAN)
-    draw_label_value(c, 40, y, "Account:", data["Account"])
-    y -= gap * 2
-
-    draw_label_value(c, 40, y, "Remarks:", data["REMARKS"])
-    y -= gap * 2
+        y -= 0.26 * inch
 
     # Footer
-    c.setFont("Helvetica-Oblique", 8)
-    c.drawString(40, 30, "Generated by internal tool. Please verify bank details before execution.")
+    y = max(y, margin + 0.7 * inch)
+    c.setFont(font_name, 8)
+    c.setFillColor(black)
+    c.drawString(margin, margin * 0.65, "This document is generated for pre-receipt purposes only.")
 
     c.showPage()
     c.save()
-    buffer.seek(0)
-    return buffer.read()
+
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
 
 
 # =========================================================
 # STREAMLIT APP
 # =========================================================
-st.set_page_config(page_title="PDF Generator", layout="centered")
-st.title("PDF Generator (Batch)")
+st.set_page_config(page_title="PDF Pre-Receipt Generator", layout="wide")
+st.title("PDF Pre-Receipt Generator")
 
-st.caption("Upload an Excel/CSV file. One PDF will be generated per row and downloaded as a ZIP.")
-
-with st.expander("Defaults", expanded=True):
-    processed_by = st.text_input("Processed by", value=DEFAULTS["processed_by"])
-    sender = st.text_input("Sender", value=DEFAULTS["sender"])
-    status = st.text_input("Status", value=DEFAULTS["status"])
-    prefix = st.text_input("Reference Prefix", value=DEFAULTS["prefix"])
+with st.sidebar:
+    st.subheader("Defaults")
+    processed_by = st.text_input("Processed by", DEFAULTS["processed_by"])
+    sender = st.text_input("Sender", DEFAULTS["sender"])
+    status = st.text_input("Status", DEFAULTS["status"])
+    prefix = st.text_input("Reference ID prefix", DEFAULTS["prefix"])
+    st.caption("Tip: add `DejaVuSans.ttf` in the app folder to avoid font squares in names/addresses.")
 
 defaults = {
     "processed_by": processed_by,
@@ -232,7 +332,7 @@ defaults = {
     "prefix": prefix,
 }
 
-uploaded = st.file_uploader("Upload file", type=["xlsx", "xls", "csv"])
+uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
 if uploaded:
     try:
@@ -241,36 +341,78 @@ if uploaded:
         else:
             df = pd.read_excel(uploaded)
 
-        # Normalize column names exactly (trim spaces)
-        df.columns = [str(c).strip() for c in df.columns]
+        # Normalize columns (trim)
+        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
 
         missing = validate_columns(df)
         if missing:
-            st.error(f"Missing columns: {missing}")
-            st.info(f"Required columns are: {REQUIRED_COLS}")
+            st.error(f"Missing required columns: {missing}")
             st.stop()
 
-        st.success(f"File loaded. Rows: {len(df)}")
-        st.dataframe(df.head(20), use_container_width=True)
+        st.success(f"Loaded {len(df)} rows.")
+        st.dataframe(df, use_container_width=True)
 
-        if st.button("Generate ZIP of PDFs"):
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            generate = st.button("Generate PDFs (ZIP)")
+
+        with col2:
+            preview_index = st.number_input(
+                "Preview row index",
+                min_value=0,
+                max_value=max(0, len(df) - 1),
+                value=0,
+                step=1,
+            )
+
+        # Preview
+        if len(df) > 0:
+            row = df.iloc[int(preview_index)].to_dict()
+
+            if not ensure_account_or_iban(row):
+                st.warning("Preview row: missing Account/IBAN value. Fill at least one.")
+            else:
+                # inject generated ref id + customer reference
+                row["_generated_reference_id"] = next_reference(prefix)
+                row["_customer_reference"] = pick_reference_from_row(row)
+
+                pdf_bytes = build_pdf_bytes(row, defaults)
+                st.download_button(
+                    label="Download preview PDF",
+                    data=pdf_bytes,
+                    file_name=f"pre_receipt_preview_{preview_index}.pdf",
+                    mime="application/pdf",
+                )
+
+        # Batch ZIP
+        if generate:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                for i, row in df.iterrows():
-                    row_dict = {k: row.get(k, "") for k in df.columns}
-                    pdf_bytes = generate_pdf_bytes(row_dict, defaults)
+                for i in range(len(df)):
+                    row = df.iloc[i].to_dict()
 
-                    ben = safe_filename(row_dict.get("Beneficiary Name", f"row_{i+1}"))
-                    filename = f"{i+1:03d}_{ben}.pdf"
+                    if not ensure_account_or_iban(row):
+                        # pula linha inválida
+                        continue
+
+                    row["_generated_reference_id"] = next_reference(prefix)
+                    row["_customer_reference"] = pick_reference_from_row(row)
+
+                    pdf_bytes = build_pdf_bytes(row, defaults)
+                    filename = f"pre_receipt_{i+1}_{row['_generated_reference_id']}.pdf"
                     zf.writestr(filename, pdf_bytes)
 
             zip_buffer.seek(0)
             st.download_button(
-                label="Download ZIP",
+                label="Download ZIP with PDFs",
                 data=zip_buffer.getvalue(),
-                file_name="pdfs.zip",
+                file_name="pre_receipts.zip",
                 mime="application/zip",
             )
 
     except Exception as e:
-        st.error(f"Error reading file: {e}")
+        st.error(f"Error processing file: {e}")
+
+else:
+    st.info("Upload a CSV or XLSX to start.")
