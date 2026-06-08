@@ -96,6 +96,9 @@ def normalize_text(value) -> str:
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
+    # pandas pode entregar NaN como string "nan" quando lido com dtype=str
+    if isinstance(value, str) and value.strip().lower() == "nan":
+        return ""
     s = str(value)
 
     # Normaliza unicode (ex: acentos)
@@ -164,7 +167,10 @@ def format_amount(value) -> str:
         if value is None or (isinstance(value, float) and pd.isna(value)):
             return ""
         # Se vier como string, tenta limpar
-        s = str(value).replace(",", "")
+        s = str(value).strip()
+        if s.lower() == "nan" or s == "":
+            return ""
+        s = s.replace(",", "")
         x = float(s)
         return f"{x:,.2f}"
     except Exception:
@@ -186,12 +192,28 @@ def safe_draw_label_value(c: canvas.Canvas, x_label, x_value, y, label, value, f
 def wrap_text(c: canvas.Canvas, text: str, max_width: float, font_name: str, font_size: int) -> list:
     """
     Quebra texto em linhas para caber em max_width.
+    Também quebra "palavras" muito longas (ex: IBAN gigante sem espaços).
     """
     c.setFont(font_name, font_size)
     words = text.split(" ")
     lines = []
     cur = ""
     for w in words:
+        # Se a própria palavra é maior que a largura, quebra caractere a caractere
+        if c.stringWidth(w, font_name, font_size) > max_width:
+            if cur:
+                lines.append(cur)
+                cur = ""
+            chunk = ""
+            for ch in w:
+                if c.stringWidth(chunk + ch, font_name, font_size) <= max_width:
+                    chunk += ch
+                else:
+                    lines.append(chunk)
+                    chunk = ch
+            cur = chunk
+            continue
+
         test = (cur + " " + w).strip()
         if c.stringWidth(test, font_name, font_size) <= max_width:
             cur = test
@@ -336,10 +358,14 @@ uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
 
 if uploaded:
     try:
+        # IMPORTANTE: lemos TODAS as colunas como texto (dtype=str).
+        # Isso evita o erro "Python int too large to convert to C long" quando
+        # números de conta/IBAN muito longos são interpretados como inteiros,
+        # e também preserva zeros à esquerda e evita notação científica.
         if uploaded.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded)
+            df = pd.read_csv(uploaded, dtype=str, keep_default_na=False)
         else:
-            df = pd.read_excel(uploaded)
+            df = pd.read_excel(uploaded, dtype=str)
 
         # Normalize columns (trim)
         df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
